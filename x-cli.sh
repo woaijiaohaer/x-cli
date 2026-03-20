@@ -232,8 +232,15 @@ fetch_url_text() {
         return $?
     fi
     if command -v wget &>/dev/null; then
-        # 不加 -4，保持与 BusyBox wget 兼容
-        wget -q -O - "$url" 2>/dev/null
+        local out
+        # 优先强制 IPv4（GNU wget 支持 -4；-T 5 超时 GNU/BusyBox 均支持）
+        out=$(wget -q -4 -T 5 -O - "$url" 2>/dev/null)
+        if [ -n "$out" ]; then
+            echo "$out"
+            return 0
+        fi
+        # BusyBox wget 不支持 -4 时降级，去掉 -4 重试
+        wget -q -T 5 -O - "$url" 2>/dev/null
         return $?
     fi
     return 1
