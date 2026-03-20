@@ -13,6 +13,156 @@ log_info() { echo -e "${COLOR_GREEN}[INFO]${COLOR_NC} $1"; }
 log_warn() { echo -e "${COLOR_YELLOW}[WARN]${COLOR_NC} $1"; }
 log_error() { echo -e "${COLOR_RED}[ERROR]${COLOR_NC} $1"; }
 
+detect_package_manager() {
+    for manager in apt-get apt dnf yum apk pacman zypper; do
+        if command -v "$manager" &>/dev/null; then
+            echo "$manager"
+            return 0
+        fi
+    done
+    return 1
+}
+
+generate_random_hex() {
+    local byte_count=$1
+
+    if command -v od &>/dev/null; then
+        od -An -N "$byte_count" -tx1 /dev/urandom 2>/dev/null | tr -d ' \n'
+        return 0
+    fi
+    if command -v hexdump &>/dev/null; then
+        hexdump -vn "$byte_count" -e '1/1 "%02x"' /dev/urandom 2>/dev/null
+        return 0
+    fi
+    if command -v openssl &>/dev/null; then
+        openssl rand -hex "$byte_count" 2>/dev/null
+        return 0
+    fi
+    return 1
+}
+
+install_packages() {
+    local manager=$1
+    shift
+
+    case "$manager" in
+        apt-get)
+            DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 &&
+                DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" >/dev/null 2>&1
+            ;;
+        apt)
+            DEBIAN_FRONTEND=noninteractive apt update -qq >/dev/null 2>&1 &&
+                DEBIAN_FRONTEND=noninteractive apt install -y -qq "$@" >/dev/null 2>&1
+            ;;
+        dnf)
+            dnf install -y "$@" >/dev/null 2>&1
+            ;;
+        yum)
+            yum install -y "$@" >/dev/null 2>&1
+            ;;
+        apk)
+            apk add --no-cache "$@" >/dev/null 2>&1
+            ;;
+        pacman)
+            pacman -Sy --noconfirm "$@" >/dev/null 2>&1
+            ;;
+        zypper)
+            zypper --non-interactive install "$@" >/dev/null 2>&1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+download_file() {
+    local url=$1 output=$2
+
+    if command -v curl &>/dev/null; then
+        curl -fsSL "$url" -o "$output"
+        return $?
+    fi
+    if command -v wget &>/dev/null; then
+        wget -q -O "$output" "$url"
+        return $?
+    fi
+    return 1
+}
+
+extract_zip_file() {
+    local zip_file=$1 dest_dir=$2 inner_path=${3:-}
+
+    if command -v unzip &>/dev/null; then
+        if [ -n "$inner_path" ]; then
+            unzip -qo "$zip_file" "$inner_path" -d "$dest_dir"
+        else
+            unzip -qo "$zip_file" -d "$dest_dir"
+        fi
+        return $?
+    fi
+    if command -v bsdtar &>/dev/null; then
+        bsdtar -xf "$zip_file" -C "$dest_dir"
+        return $?
+    fi
+    if command -v busybox &>/dev/null && busybox unzip >/dev/null 2>&1; then
+        if [ -n "$inner_path" ]; then
+            busybox unzip -o "$zip_file" "$inner_path" -d "$dest_dir" >/dev/null 2>&1
+        else
+            busybox unzip -o "$zip_file" -d "$dest_dir" >/dev/null 2>&1
+        fi
+        return $?
+    fi
+    if command -v python3 &>/dev/null; then
+        python3 - "$zip_file" "$dest_dir" "$inner_path" <<'PY'
+import sys
+import zipfile
+
+zip_path, dest_dir, inner_path = sys.argv[1:4]
+with zipfile.ZipFile(zip_path) as zf:
+    if inner_path:
+        zf.extract(inner_path, dest_dir)
+    else:
+        zf.extractall(dest_dir)
+PY
+        return $?
+    fi
+    return 1
+}
+
+ensure_jq() {
+    if command -v jq &>/dev/null; then
+        return 0
+    fi
+
+    local pkg_manager jq_arch jq_url tmp_file
+    pkg_manager=$(detect_package_manager)
+    if [ -n "$pkg_manager" ] && install_packages "$pkg_manager" jq; then
+        command -v jq &>/dev/null && return 0
+    fi
+
+    case "$(uname -m)" in
+        x86_64) jq_arch="amd64" ;;
+        aarch64|arm64) jq_arch="arm64" ;;
+        armv7l) jq_arch="armhf" ;;
+        *)
+            log_error "当前架构不支持自动下载 jq: $(uname -m)"
+            return 1
+            ;;
+    esac
+
+    jq_url="https://github.com/jqlang/jq/releases/latest/download/jq-linux-${jq_arch}"
+    tmp_file=$(mktemp /tmp/jq.XXXXXX)
+    log_info "尝试下载独立 jq 二进制..."
+    if ! download_file "$jq_url" "$tmp_file"; then
+        rm -f "$tmp_file"
+        log_error "jq 下载失败"
+        return 1
+    fi
+    install -m 0755 "$tmp_file" /usr/local/bin/jq
+    rm -f "$tmp_file"
+    command -v jq &>/dev/null
+}
+
 check_root() {
     if [ "$(id -u)" != "0" ]; then
         log_error "需要 root 权限"
@@ -22,14 +172,11 @@ check_root() {
 
 check_ipv4() {
     log_info "检查网络..."
-    for url in "https://ifconfig.me" "https://ip.sb" "https://api.ipify.org"; do
-        local ip=$(curl -s -4 --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')
-        if [ -n "$ip" ] && [[ ! "$ip" == *":"* ]]; then
-            SERVER_IP="$ip"
-            log_info "服务器 IPv4: $SERVER_IP"
-            return 0
-        fi
-    done
+    SERVER_IP=$(get_public_ipv4)
+    if [ -n "$SERVER_IP" ]; then
+        log_info "服务器 IPv4: $SERVER_IP"
+        return 0
+    fi
     log_error "无法获取 IPv4"
     exit 1
 }
@@ -39,13 +186,30 @@ check_xray() {
 }
 
 check_deps() {
-    local missing=()
-    for cmd in curl jq openssl wget qrencode; do
-        command -v $cmd &>/dev/null || missing+=($cmd)
-    done
-    if [ ${#missing[@]} -gt 0 ]; then
-        log_info "安装依赖：${missing[*]}"
-        apt update -qq && apt install -y -qq ${missing[@]} >/dev/null 2>&1
+    local pkg_manager
+
+    # curl 和 wget 至少有一个即可，两者都缺才尝试安装
+    if ! command -v curl &>/dev/null && ! command -v wget &>/dev/null; then
+        log_info "安装下载工具（curl/wget）..."
+        pkg_manager=$(detect_package_manager)
+        if [ -z "$pkg_manager" ]; then
+            log_error "curl 和 wget 均不可用，且未找到受支持的包管理器"
+            log_error "请手动安装 curl 或 wget 后重试"
+            exit 1
+        fi
+        if ! install_packages "$pkg_manager" wget curl; then
+            log_error "安装下载工具失败，请手动安装 curl 或 wget"
+            exit 1
+        fi
+    fi
+
+    if ! ensure_jq; then
+        log_error "缺少 jq，且自动安装/下载失败"
+        exit 1
+    fi
+
+    if ! command -v qrencode &>/dev/null; then
+        log_warn "未安装 qrencode，后续仅输出链接，不显示二维码"
     fi
 }
 
@@ -53,8 +217,39 @@ check_geoip() {
     if [ ! -f /usr/local/share/xray/geoip.dat ]; then
         log_info "下载 GeoIP..."
         mkdir -p /usr/local/share/xray
-        wget -q -O /usr/local/share/xray/geoip.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
+        if ! download_file "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" "/usr/local/share/xray/geoip.dat"; then
+            log_error "GeoIP 下载失败"
+            exit 1
+        fi
     fi
+}
+
+fetch_url_text() {
+    local url=$1
+
+    if command -v curl &>/dev/null; then
+        curl -fsSL -4 --max-time 5 "$url" 2>/dev/null
+        return $?
+    fi
+    if command -v wget &>/dev/null; then
+        # 不加 -4，保持与 BusyBox wget 兼容
+        wget -q -O - "$url" 2>/dev/null
+        return $?
+    fi
+    return 1
+}
+
+get_public_ipv4() {
+    local ip url
+
+    for url in "https://ifconfig.me" "https://ip.sb" "https://api.ipify.org"; do
+        ip=$(fetch_url_text "$url" | tr -d '[:space:]')
+        if [ -n "$ip" ] && [[ ! "$ip" == *":"* ]]; then
+            echo "$ip"
+            return 0
+        fi
+    done
+    return 1
 }
 
 random_domain() {
@@ -69,6 +264,10 @@ generate_keys() {
     PUBLIC_KEY=$(echo "$key_pair" | grep "Public key:" | awk '{print $3}')
 
     if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
+        if ! command -v openssl &>/dev/null; then
+            log_error "xray x25519 失败，且系统缺少 openssl，无法回退生成密钥"
+            exit 1
+        fi
         log_warn "xray x25519 失败，使用 openssl 生成 x25519 密钥..."
         local pem_file
         pem_file=$(mktemp /tmp/xray_key.XXXXXX.pem)
@@ -87,8 +286,12 @@ generate_keys() {
         log_error "密钥生成失败（xray x25519 和 openssl 均失败）"
         exit 1
     fi
-    SHORT_ID=$(openssl rand -hex 4)
-    SHORT_IDS="[\"\", \"${SHORT_ID}\", \"$(openssl rand -hex 2)\", \"$(openssl rand -hex 3)\", \"$(openssl rand -hex 4)\"]"
+    SHORT_ID=$(generate_random_hex 4)
+    SHORT_IDS="[\"\", \"${SHORT_ID}\", \"$(generate_random_hex 2)\", \"$(generate_random_hex 3)\", \"$(generate_random_hex 4)\"]"
+    if [ -z "$SHORT_ID" ] || [ -z "$SHORT_IDS" ]; then
+        log_error "随机 Short ID 生成失败"
+        exit 1
+    fi
     log_info "PublicKey: $PUBLIC_KEY"
 }
 
@@ -108,10 +311,12 @@ install_compat_xray() {
     local try_versions=("v24.12.31" "v1.8.23")
     for ver in "${try_versions[@]}"; do
         log_info "尝试下载 Xray ${ver} ($arch)..."
-        wget -q -O /tmp/xray_compat.zip \
-            "https://github.com/XTLS/Xray-core/releases/download/${ver}/${zipname}" || \
+            download_file \
+                "https://github.com/XTLS/Xray-core/releases/download/${ver}/${zipname}" \
+                /tmp/xray_compat.zip || \
             { log_warn "下载 ${ver} 失败，尝试下一版本..."; continue; }
-        unzip -qo /tmp/xray_compat.zip xray -d /usr/local/bin/
+            extract_zip_file /tmp/xray_compat.zip /usr/local/bin xray || \
+                { rm -f /tmp/xray_compat.zip; log_warn "缺少可用的 zip 解包工具，尝试下一版本..."; continue; }
         chmod +x /usr/local/bin/xray
         rm -f /tmp/xray_compat.zip
         if /usr/local/bin/xray x25519 &>/dev/null; then
@@ -133,12 +338,25 @@ install_xray() {
         log_warn "当前 Xray 与 CPU 不兼容（SIGILL），安装兼容版本..."
         install_compat_xray
     else
-        log_info "安装 Xray（最新版）..."
-        bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install 2>/dev/null
-        if /usr/local/bin/xray x25519 &>/dev/null; then
-            return 0
+        # 官方安装脚本内部使用 curl，无 curl 时直接走兼容版本路径
+        if command -v curl &>/dev/null; then
+            log_info "安装 Xray（最新版）..."
+            local installer
+            installer=$(mktemp /tmp/xray_install.XXXXXX.sh)
+            if download_file "https://github.com/XTLS/Xray-install/raw/main/install-release.sh" "$installer"; then
+                bash "$installer" @ install 2>/dev/null
+                rm -f "$installer"
+                if /usr/local/bin/xray x25519 &>/dev/null; then
+                    return 0
+                fi
+                log_warn "最新版本不兼容当前 CPU（SIGILL），安装兼容版本..."
+            else
+                rm -f "$installer"
+                log_warn "安装脚本下载失败，直接安装兼容版本..."
+            fi
+        else
+            log_info "curl 不可用，跳过官方安装脚本，直接安装兼容版本..."
         fi
-        log_warn "最新版本不兼容当前 CPU（SIGILL），安装兼容版本 v1.8.23..."
         install_compat_xray
     fi
     if ! /usr/local/bin/xray x25519 &>/dev/null; then
@@ -163,7 +381,6 @@ open_firewall_port() {
 uninstall_xray() {
     log_info "停止服务..."
     /etc/init.d/xray stop 2>/dev/null || true
-    
     log_info "删除文件..."
     rm -f /etc/init.d/xray
     rm -f /usr/local/bin/xray
@@ -171,14 +388,14 @@ uninstall_xray() {
     rm -rf /usr/local/share/xray
     rm -rf /var/log/xray
     rm -f /root/xray_config.txt
-    
+
     log_info "卸载完成"
 }
 
 create_config() {
     local domain=$1 port=$2
     mkdir -p /usr/local/etc/xray /var/log/xray
-    
+
     cat > /usr/local/etc/xray/config.json << EOFCONFIG
 {
   "log": {"loglevel": "warning"},
@@ -266,9 +483,9 @@ generate_links() {
     UUID=$(jq -r '.inbounds[1].settings.clients[0].id' /usr/local/etc/xray/config.json)
     PUBKEY=$(jq -r '.inbounds[1].streamSettings.realitySettings.publicKey' /usr/local/etc/xray/config.json)
     SHORTID=$(jq -r '.inbounds[1].streamSettings.realitySettings.shortIds[1]' /usr/local/etc/xray/config.json)
-    
+
     local LINK="vless://${UUID}@${ip}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${domain}&fp=chrome&pbk=${PUBKEY}&sid=${SHORTID}&type=tcp#VLESS-${port}"
-    
+
     echo ""
     echo "=========================================="
     echo "      Xray VLESS Reality 完成"
@@ -280,7 +497,7 @@ generate_links() {
     echo "$LINK"
     echo ""
     qrencode -t ANSIUTF8 "$LINK" 2>/dev/null || log_warn "qrencode 未安装"
-    
+
     cat > /root/xray_config.txt << EOFSAVE
 === Xray VLESS Reality ===
 服务器 IPv4: ${ip}
@@ -356,7 +573,7 @@ EOFJSON
     /etc/init.d/xray restart
     sleep 1
     local pub_ip
-    pub_ip=$(curl -s -4 --max-time 5 https://api.ipify.org 2>/dev/null | tr -d '[:space:]')
+    pub_ip=$(get_public_ipv4)
     local LINK="vless://${new_uuid}@${pub_ip}:${new_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${domain}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#VLESS-${new_port}"
     echo ""
     log_info "端口 $new_port 已添加"
@@ -439,8 +656,7 @@ diag() {
     echo ""
     echo -e "  ${COLOR_YELLOW}▸ 网络${COLOR_NC}"
     local pub_ip
-    pub_ip=$(curl -s -4 --max-time 5 https://api.ipify.org 2>/dev/null | tr -d '[:space:]')
-    [ -z "$pub_ip" ] && pub_ip=$(curl -s -4 --max-time 5 https://ifconfig.me 2>/dev/null | tr -d '[:space:]')
+    pub_ip=$(get_public_ipv4)
     if [ -n "$pub_ip" ]; then
         echo -e "    公网 IP: ${COLOR_GREEN}${pub_ip}${COLOR_NC}"
     else
@@ -517,8 +733,7 @@ list_ports() {
         exit 1
     fi
     local pub_ip
-    pub_ip=$(curl -s -4 --max-time 5 https://api.ipify.org 2>/dev/null | tr -d '[:space:]')
-    [ -z "$pub_ip" ] && pub_ip=$(curl -s -4 --max-time 5 https://ifconfig.me 2>/dev/null | tr -d '[:space:]')
+    pub_ip=$(get_public_ipv4)
 
     local count
     count=$(jq '[.inbounds[] | select(.protocol == "vless")] | length' /usr/local/etc/xray/config.json)
@@ -557,8 +772,7 @@ show_link() {
         log_error "配置不存在"
         exit 1
     fi
-    local ip=$(curl -s -4 https://ifconfig.me 2>/dev/null | tr -d '[:space:]')
-    [ -z "$ip" ] && ip=$(curl -s -4 https://api.ipify.org 2>/dev/null | tr -d '[:space:]')
+    local ip=$(get_public_ipv4)
     if [ -z "$ip" ]; then
         log_error "无法获取 IP"
         exit 1
@@ -583,10 +797,10 @@ reinstall() {
             exit 0
         fi
     fi
-    
+
     uninstall_xray
     sleep 2
-    
+
     DOMAIN=$(random_domain)
     log_info "随机域名：$DOMAIN"
     check_deps
@@ -754,8 +968,7 @@ list_ports() {
         exit 1
     fi
     local pub_ip
-    pub_ip=$(curl -s -4 --max-time 5 https://api.ipify.org 2>/dev/null | tr -d '[:space:]')
-    [ -z "$pub_ip" ] && pub_ip=$(curl -s -4 --max-time 5 https://ifconfig.me 2>/dev/null | tr -d '[:space:]')
+    pub_ip=$(get_public_ipv4)
 
     # 如果是交互调用，先让用户选
     if [ -t 0 ]; then

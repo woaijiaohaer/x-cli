@@ -32,6 +32,7 @@
 - **防火墙自动放行**：自动配置 `iptables` / `ufw`
 - **二维码输出**：终端直接显示 VLESS 链接二维码
 - **诊断工具**：一键检查进程状态、端口监听、公网连通性
+- **极简环境兼容**：没有 `apt` 时自动尝试 `dnf` / `yum` / `apk` / `pacman` / `zypper`，仅有 `curl` 或 `wget` 时也可继续安装
 - **交互菜单 + CLI 双模式**：适合日常管理与脚本自动化
 
 ---
@@ -40,9 +41,10 @@
 
 | 项目 | 要求 |
 |------|------|
-| 操作系统 | Debian / Ubuntu（基于 apt）|
+| 操作系统 | 常见 Linux 发行版 |
 | 权限 | root |
-| 依赖（自动安装） | `curl` `jq` `openssl` `wget` `qrencode` |
+| 最低下载能力 | `curl` 或 `wget` 至少一个 |
+| 依赖处理 | 优先使用系统包管理器自动安装；无包管理器时自动下载 `jq`；`qrencode` 缺失时仅不显示二维码 |
 
 ---
 
@@ -51,7 +53,12 @@
 ### 下载脚本
 
 ```bash
-wget -O x-cli.sh https://raw.githubusercontent.com/woaijiaohaer/x-cli/main/x-cli.sh
+# 用 wget（推荐）
+wget -O x-cli.sh https://raw.githubusercontent.com/woaijiaohaer/x-cli/master/x-cli.sh
+
+# 或用 curl
+curl -fsSL -o x-cli.sh https://raw.githubusercontent.com/woaijiaohaer/x-cli/master/x-cli.sh
+
 chmod +x x-cli.sh
 ```
 
