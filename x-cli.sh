@@ -487,6 +487,13 @@ EOF
 
 generate_links() {
     local ip=$1 port=$2 domain=$3
+    if [ -z "$ip" ]; then
+        ip=$(get_public_ipv4)
+    fi
+    if [ -z "$ip" ]; then
+        log_error "无法获取公网 IPv4，无法生成客户端链接"
+        exit 1
+    fi
     UUID=$(jq -r '.inbounds[1].settings.clients[0].id' /usr/local/etc/xray/config.json)
     PUBKEY=$(jq -r '.inbounds[1].streamSettings.realitySettings.publicKey' /usr/local/etc/xray/config.json)
     SHORTID=$(jq -r '.inbounds[1].streamSettings.realitySettings.shortIds[1]' /usr/local/etc/xray/config.json)
