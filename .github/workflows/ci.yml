@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint-test-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install shell tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck make git
+
+      - name: Bootstrap bats
+        run: bash hack/bootstrap-bats.sh
+
+      - name: Lint
+        run: bash hack/lint.sh
+
+      - name: Tests
+        run: make test
+
+      - name: Build
+        run: bash hack/build.sh
+
+      - name: Verify generated script consistency
+        run: git diff --exit-code -- x-cli.sh

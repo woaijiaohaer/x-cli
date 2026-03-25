@@ -1,0 +1,6 @@
+www.microsoft.com
+www.apple.com
+www.oracle.com
+www.ibm.com
+www.samsung.com
+www.qualcomm.com
